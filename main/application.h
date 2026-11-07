@@ -152,6 +152,9 @@ private:
     bool play_popup_on_listening_ = false;  // Flag to play popup sound after state changes to listening
     bool pending_listening_start_ = false;  // Waiting for playback to drain before starting listening (auto mode)
     int clock_ticks_ = 0;
+    int64_t wifi_lost_at_us_ = 0;
+    bool using_ble_ = false;
+    bool network_protocol_is_mqtt_ = false;
     TaskHandle_t activation_task_handle_ = nullptr;
 
 
@@ -180,6 +183,10 @@ private:
     void CheckAssetsVersion();
     void CheckNewVersion();
     void InitializeProtocol();
+    void BindProtocolCallbacks();
+    void ConsiderBleFallback();
+    void UseWifiForNextTurn();
+    std::unique_ptr<Protocol> MakeNetworkProtocol();
     void ShowActivationCode(const std::string& code, const std::string& message);
     void SetListeningMode(ListeningMode mode);
     ListeningMode GetDefaultListeningMode() const;

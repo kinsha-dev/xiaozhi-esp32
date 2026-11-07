@@ -6,6 +6,7 @@
 #include "cjson_utils.h"
 #include "display.h"
 #include "mcp_server.h"
+#include "ble_protocol.h"
 #include "mqtt_protocol.h"
 #include "settings.h"
 #include "system_info.h"
@@ -14,6 +15,8 @@
 
 #include <driver/gpio.h>
 #include <esp_log.h>
+#include <esp_timer.h>
+#include <wifi_manager.h>
 #include <arpa/inet.h>
 #include <cJSON.h>
 #include <cstring>
@@ -282,6 +285,7 @@ void Application::Run() {
                 // SystemInfo::PrintTaskList();
                 // SystemInfo::PrintTaskCpuUsage(pdMS_TO_TICKS(1000));
             }
+            ConsiderBleFallback();
         }
     }
 }
@@ -314,6 +318,12 @@ void Application::HandleNetworkConnectedEvent() {
 }
 
 void Application::HandleNetworkDisconnectedEvent() {
+    // Stopping the station for a BLE turn also reports "disconnected".
+    // That must not tear the BLE audio channel down.
+    if (using_ble_) {
+        Board::GetInstance().GetDisplay()->UpdateStatusBar(true);
+        return;
+    }
     // Close current conversation when network disconnected
     auto state = GetDeviceState();
     if (state == kDeviceStateNotifying) {
@@ -529,20 +539,33 @@ void Application::CheckNewVersion() {
 }
 
 void Application::InitializeProtocol() {
-    auto& board = Board::GetInstance();
-    auto display = board.GetDisplay();
-    auto codec = board.GetAudioCodec();
-
+    auto display = Board::GetInstance().GetDisplay();
     display->SetStatus(Lang::Strings::LOADING_PROTOCOL);
 
     if (ota_->HasMqttConfig()) {
-        protocol_ = std::make_unique<MqttProtocol>();
+        network_protocol_is_mqtt_ = true;
     } else if (ota_->HasWebsocketConfig()) {
-        protocol_ = std::make_unique<WebsocketProtocol>();
+        network_protocol_is_mqtt_ = false;
     } else {
         ESP_LOGW(TAG, "No protocol specified in the OTA config, using MQTT");
-        protocol_ = std::make_unique<MqttProtocol>();
+        network_protocol_is_mqtt_ = true;
     }
+    protocol_ = MakeNetworkProtocol();
+    BindProtocolCallbacks();
+    protocol_->Start();
+}
+
+std::unique_ptr<Protocol> Application::MakeNetworkProtocol() {
+    if (network_protocol_is_mqtt_) {
+        return std::make_unique<MqttProtocol>();
+    }
+    return std::make_unique<WebsocketProtocol>();
+}
+
+void Application::BindProtocolCallbacks() {
+    auto& board = Board::GetInstance();
+    auto display = board.GetDisplay();
+    auto codec = board.GetAudioCodec();
 
     protocol_->OnConnected([this]() { DismissAlert(); });
 
@@ -721,8 +744,55 @@ void Application::InitializeProtocol() {
             ESP_LOGW(TAG, "Unknown message type: %s", type->valuestring);
         }
     });
+}
 
+void Application::UseWifiForNextTurn() {
+    if (!using_ble_ || !WifiManager::GetInstance().IsConnected()) {
+        return;
+    }
+    ESP_LOGI(TAG, "Wi-Fi is up; this turn uses the websocket");
+    using_ble_ = false;
+    wifi_lost_at_us_ = 0;
+    protocol_ = MakeNetworkProtocol();
+    BindProtocolCallbacks();
     protocol_->Start();
+}
+
+void Application::ConsiderBleFallback() {
+    auto& wifi = WifiManager::GetInstance();
+    if (wifi.IsConfigMode() || GetDeviceState() == kDeviceStateWifiConfiguring) {
+        wifi_lost_at_us_ = 0;
+        return;
+    }
+    const bool idle = GetDeviceState() == kDeviceStateIdle;
+    const bool channel = protocol_ && protocol_->IsAudioChannelOpened();
+    if (wifi.IsConnected()) {
+        wifi_lost_at_us_ = 0;
+        if (using_ble_ && idle && !channel) {
+            ESP_LOGI(TAG, "Wi-Fi back; leaving BLE fallback");
+            using_ble_ = false;
+            protocol_ = MakeNetworkProtocol();
+            BindProtocolCallbacks();
+            protocol_->Start();
+        }
+        return;
+    }
+    if (wifi_lost_at_us_ == 0) {
+        wifi_lost_at_us_ = esp_timer_get_time();
+        return;
+    }
+    const int64_t down_s = (esp_timer_get_time() - wifi_lost_at_us_) / 1000000LL;
+    if (!using_ble_ && idle && !channel && down_s >= 600) {
+        auto ble = std::make_unique<BleProtocol>();
+        if (!ble->Start()) {
+            ESP_LOGE(TAG, "BLE fallback failed to start");
+            return;
+        }
+        ESP_LOGI(TAG, "Wi-Fi down for %lld s; BLE fallback on", static_cast<long long>(down_s));
+        using_ble_ = true;
+        protocol_ = std::move(ble);
+        BindProtocolCallbacks();
+    }
 }
 
 void Application::ShowActivationCode(const std::string& code, const std::string& message) {
@@ -829,6 +899,7 @@ void Application::ContinueOpenAudioChannel(ListeningMode mode) {
     auto& board = Board::GetInstance();
     board.SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
 
+    UseWifiForNextTurn();
     if (!protocol_->IsAudioChannelOpened()) {
         if (!protocol_->OpenAudioChannel()) {
             // Return to idle so the device is not stuck in the connecting
@@ -965,6 +1036,7 @@ void Application::ContinueWakeWordInvoke(const std::string& wake_word) {
     auto& board = Board::GetInstance();
     board.SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
 
+    UseWifiForNextTurn();
     if (!protocol_->IsAudioChannelOpened()) {
         if (!protocol_->OpenAudioChannel()) {
             // Return to idle so the device is not stuck in the connecting
