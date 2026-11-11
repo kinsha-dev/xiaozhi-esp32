@@ -18,6 +18,8 @@
 #include <esp_timer.h>
 #include <wifi_manager.h>
 #include <arpa/inet.h>
+#include <lwip/netdb.h>
+#include <lwip/sockets.h>
 #include <cJSON.h>
 #include <cstring>
 #include <limits>
@@ -285,6 +287,13 @@ void Application::Run() {
                 // SystemInfo::PrintTaskList();
                 // SystemInfo::PrintTaskCpuUsage(pdMS_TO_TICKS(1000));
             }
+            // Watchdog: a notification that never reports completion must not
+            // leave the board stuck (amber ring, unresponsive).
+            if (GetDeviceState() == kDeviceStateNotifying &&
+                clock_ticks_ - notify_started_tick_ > 120) {
+                ESP_LOGW(TAG, "Notification stuck for >120s, stopping");
+                StopNotification();
+            }
             ConsiderBleFallback();
         }
     }
@@ -376,11 +385,18 @@ void Application::ActivationTask() {
     // Create OTA object for activation process
     ota_ = std::make_unique<Ota>();
 
-    // Check for new assets version
-    CheckAssetsVersion();
+    // Bluetooth forced from the Mac menu: do not touch the server (it may be unreachable), just start.
+    ble_forced_ = Settings("network", false).GetBool("force_ble", false);
+    if (ble_forced_) {
+        ESP_LOGI(TAG, "Bluetooth link forced: skipping the version check");
+        ota_->MarkCurrentVersionValid();
+    } else {
+        // Check for new assets version
+        CheckAssetsVersion();
 
-    // Check for new firmware version
-    CheckNewVersion();
+        // Check for new firmware version
+        CheckNewVersion();
+    }
 
     // Initialize the protocol
     InitializeProtocol();
@@ -450,7 +466,7 @@ void Application::CheckAssetsVersion() {
 }
 
 void Application::CheckNewVersion() {
-    const int MAX_RETRY = 10;
+    const int MAX_RETRY = 3;  // 10 + 20 s of waiting, then carry on and let Bluetooth take over
     int retry_count = 0;
     int retry_delay = 10;  // Initial retry delay in seconds
 
@@ -464,6 +480,8 @@ void Application::CheckNewVersion() {
             retry_count++;
             if (retry_count >= MAX_RETRY) {
                 ESP_LOGE(TAG, "Too many retries, exit version check");
+                version_check_failed_ = true;
+                ota_->MarkCurrentVersionValid();
                 return;
             }
 
@@ -546,6 +564,9 @@ void Application::InitializeProtocol() {
         network_protocol_is_mqtt_ = true;
     } else if (ota_->HasWebsocketConfig()) {
         network_protocol_is_mqtt_ = false;
+    } else if (!Settings("websocket", false).GetString("url").empty()) {
+        // No OTA answer this boot: use the websocket address saved by an earlier one.
+        network_protocol_is_mqtt_ = false;
     } else {
         ESP_LOGW(TAG, "No protocol specified in the OTA config, using MQTT");
         network_protocol_is_mqtt_ = true;
@@ -553,6 +574,11 @@ void Application::InitializeProtocol() {
     protocol_ = MakeNetworkProtocol();
     BindProtocolCallbacks();
     protocol_->Start();
+    if (version_check_failed_) {
+        ESP_LOGW(TAG, "Server did not answer at startup; Bluetooth takes over until it does");
+        server_unreachable_ = true;
+        next_probe_us_ = esp_timer_get_time() + 15 * 1000000LL;
+    }
 }
 
 std::unique_ptr<Protocol> Application::MakeNetworkProtocol() {
@@ -709,6 +735,10 @@ void Application::BindProtocolCallbacks() {
                 if (strcmp(command->valuestring, "reboot") == 0) {
                     // Do a reboot if user requests a OTA update
                     Schedule([this]() { Reboot(); });
+                } else if (strcmp(command->valuestring, "link_bluetooth") == 0) {
+                    SetLinkMode(true);
+                } else if (strcmp(command->valuestring, "link_auto") == 0) {
+                    SetLinkMode(false);
                 } else {
                     ESP_LOGW(TAG, "Unknown system command: %s", command->valuestring);
                 }
@@ -747,7 +777,7 @@ void Application::BindProtocolCallbacks() {
 }
 
 void Application::UseWifiForNextTurn() {
-    if (!using_ble_ || !WifiManager::GetInstance().IsConnected()) {
+    if (!using_ble_ || BleWanted() || !WifiManager::GetInstance().IsConnected()) {
         return;
     }
     ESP_LOGI(TAG, "Wi-Fi is up; this turn uses the websocket");
@@ -758,6 +788,85 @@ void Application::UseWifiForNextTurn() {
     protocol_->Start();
 }
 
+bool Application::BleWanted() const {
+    return ble_forced_ || server_unreachable_;
+}
+
+void Application::NoteOpenFailure() {
+    // The server did not answer over Wi-Fi: use Bluetooth until a probe reaches it again.
+    if (using_ble_ || !WifiManager::GetInstance().IsConnected()) {
+        return;
+    }
+    if (!server_unreachable_) {
+        ESP_LOGW(TAG, "Server did not answer over Wi-Fi; switching to Bluetooth");
+    }
+    server_unreachable_ = true;
+    next_probe_us_ = esp_timer_get_time() + 15 * 1000000LL;
+}
+
+void Application::SetLinkMode(bool bluetooth) {
+    ble_forced_ = bluetooth;
+    Settings settings("network", true);
+    settings.SetBool("force_ble", bluetooth);
+    ESP_LOGI(TAG, "Link mode: %s", bluetooth ? "bluetooth" : "auto");
+    if (!bluetooth) {
+        server_unreachable_ = false;
+    }
+}
+
+void Application::ProbeServer() {
+    // One short HTTP GET to <OTA host>/xiaozhi/link from a helper task: the server is reachable if it answers,
+    // and the body says which link the Mac menu wants ("auto" or "bluetooth"). Result in server_probe_result_:
+    // 0 none yet, 1 reachable and auto, 2 unreachable, 3 reachable and bluetooth.
+    if (server_probe_running_.exchange(true)) {
+        return;
+    }
+    xTaskCreate([](void* arg) {
+        auto* self = static_cast<Application*>(arg);
+        int result = 2;
+        std::string url = CONFIG_OTA_URL;
+        size_t at = url.find("://");
+        std::string rest = at == std::string::npos ? url : url.substr(at + 3);
+        size_t slash = rest.find('/');
+        std::string hostport = rest.substr(0, slash);
+        std::string host = hostport;
+        std::string port = "80";
+        size_t colon = hostport.rfind(':');
+        if (colon != std::string::npos) {
+            host = hostport.substr(0, colon);
+            port = hostport.substr(colon + 1);
+        }
+        struct addrinfo hints = {};
+        hints.ai_socktype = SOCK_STREAM;
+        struct addrinfo* res = nullptr;
+        if (getaddrinfo(host.c_str(), port.c_str(), &hints, &res) == 0 && res != nullptr) {
+            int fd = socket(res->ai_family, res->ai_socktype, 0);
+            if (fd >= 0) {
+                struct timeval tv = {3, 0};
+                setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+                setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+                if (connect(fd, res->ai_addr, res->ai_addrlen) == 0) {
+                    std::string req = "GET /xiaozhi/link HTTP/1.0\r\nHost: " + hostport + "\r\n\r\n";
+                    send(fd, req.data(), req.size(), 0);
+                    char buf[256];
+                    int n = recv(fd, buf, sizeof(buf) - 1, 0);
+                    if (n > 0) {
+                        buf[n] = 0;
+                        result = strstr(buf, "bluetooth") != nullptr ? 3 : 1;
+                        self->server_silent_.store(strstr(buf, "silent") != nullptr);
+                        self->server_muted_.store(strstr(buf, "muted") != nullptr);
+                    }
+                }
+                close(fd);
+            }
+            freeaddrinfo(res);
+        }
+        self->server_probe_result_.store(result);
+        self->server_probe_running_.store(false);
+        vTaskDelete(NULL);
+    }, "server_probe", 4096, this, 2, NULL);
+}
+
 void Application::ConsiderBleFallback() {
     auto& wifi = WifiManager::GetInstance();
     if (wifi.IsConfigMode() || GetDeviceState() == kDeviceStateWifiConfiguring) {
@@ -766,9 +875,55 @@ void Application::ConsiderBleFallback() {
     }
     const bool idle = GetDeviceState() == kDeviceStateIdle;
     const bool channel = protocol_ && protocol_->IsAudioChannelOpened();
+    const int64_t now = esp_timer_get_time();
+
     if (wifi.IsConnected()) {
         wifi_lost_at_us_ = 0;
-        if (using_ble_ && idle && !channel) {
+    } else if (wifi_lost_at_us_ == 0) {
+        wifi_lost_at_us_ = now;
+    }
+    const int64_t down_s = wifi_lost_at_us_ == 0 ? 0 : (now - wifi_lost_at_us_) / 1000000LL;
+    const bool wifi_long_down = !wifi.IsConnected() && wifi_lost_at_us_ != 0 && down_s >= 600;
+
+    // Over Wi-Fi, ask the server every 15 s what the Mac menu wants and whether it answers at all. Three misses in a
+    // row mark the server unreachable (Bluetooth takes over); the next answer clears it. Not while a turn is running.
+    if (wifi.IsConnected() && idle && !channel && !(using_ble_ && ble_forced_)) {
+        const int result = server_probe_result_.exchange(0);
+        if (result == 1 || result == 3) {
+            static bool shown_silent = false;
+            static bool shown_muted = false;
+            if (shown_silent != server_silent_.load() || shown_muted != server_muted_.load()) {  // silent/mute started or ended: refresh the LED
+                shown_silent = server_silent_.load();
+                shown_muted = server_muted_.load();
+                if (auto led = Board::GetInstance().GetLed()) {
+                    led->OnStateChanged();
+                }
+            }
+        }
+        if (result == 2) {
+            if (++probe_misses_ >= 3 && !server_unreachable_) {
+                ESP_LOGW(TAG, "Server did not answer 3 checks over Wi-Fi; switching to Bluetooth");
+                server_unreachable_ = true;
+            }
+        } else if (result == 1 || result == 3) {
+            probe_misses_ = 0;
+            if (server_unreachable_) {
+                ESP_LOGI(TAG, "Server reachable over Wi-Fi again");
+                server_unreachable_ = false;
+            }
+            if ((result == 3) != ble_forced_) {
+                SetLinkMode(result == 3);
+            }
+        }
+        if (now >= next_probe_us_) {
+            next_probe_us_ = now + 15 * 1000000LL;
+            ProbeServer();
+        }
+    }
+
+    const bool want_ble = BleWanted() || wifi_long_down;
+    if (using_ble_) {
+        if (!want_ble && wifi.IsConnected() && idle && !channel) {
             ESP_LOGI(TAG, "Wi-Fi back; leaving BLE fallback");
             using_ble_ = false;
             protocol_ = MakeNetworkProtocol();
@@ -777,18 +932,14 @@ void Application::ConsiderBleFallback() {
         }
         return;
     }
-    if (wifi_lost_at_us_ == 0) {
-        wifi_lost_at_us_ = esp_timer_get_time();
-        return;
-    }
-    const int64_t down_s = (esp_timer_get_time() - wifi_lost_at_us_) / 1000000LL;
-    if (!using_ble_ && idle && !channel && down_s >= 600) {
+    if (want_ble && idle && !channel) {
         auto ble = std::make_unique<BleProtocol>();
         if (!ble->Start()) {
             ESP_LOGE(TAG, "BLE fallback failed to start");
             return;
         }
-        ESP_LOGI(TAG, "Wi-Fi down for %lld s; BLE fallback on", static_cast<long long>(down_s));
+        ESP_LOGI(TAG, "BLE fallback on (forced=%d unreachable=%d wifi_down_s=%lld)", ble_forced_ ? 1 : 0,
+                 server_unreachable_ ? 1 : 0, static_cast<long long>(down_s));
         using_ble_ = true;
         protocol_ = std::move(ble);
         BindProtocolCallbacks();
@@ -902,6 +1053,7 @@ void Application::ContinueOpenAudioChannel(ListeningMode mode) {
     UseWifiForNextTurn();
     if (!protocol_->IsAudioChannelOpened()) {
         if (!protocol_->OpenAudioChannel()) {
+            NoteOpenFailure();
             // Return to idle so the device is not stuck in the connecting
             // state (not every failure path reports a network error)
             SetDeviceState(kDeviceStateIdle);
@@ -1039,6 +1191,7 @@ void Application::ContinueWakeWordInvoke(const std::string& wake_word) {
     UseWifiForNextTurn();
     if (!protocol_->IsAudioChannelOpened()) {
         if (!protocol_->OpenAudioChannel()) {
+            NoteOpenFailure();
             // Return to idle so the device is not stuck in the connecting
             // state (not every failure path reports a network error), and
             // wake word detection is re-enabled by the idle state handler.
@@ -1191,6 +1344,7 @@ void Application::StartNotification(std::string audio_url, std::vector<NotifySub
     }
 
     audio_service_.ResetDecoder();
+    notify_started_tick_ = clock_ticks_;
     uint32_t playback_id = ++notification_playback_id_;
     if (playback_id == 0) {
         playback_id = ++notification_playback_id_;

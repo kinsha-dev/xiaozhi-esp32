@@ -461,6 +461,15 @@ void BleProtocol::HandleJson(const std::string& text) {
     auto type = cJSON_GetObjectItem(root, "type");
     if (cJSON_IsString(type) && std::strcmp(type->valuestring, "hello") == 0) {
         ParseServerHello(root);
+    } else if (cJSON_IsString(type) && std::strcmp(type->valuestring, "ble_close") == 0) {
+        // The Mac relay says the server closed the session: same as a websocket disconnect.
+        if (channel_open_) {
+            channel_open_ = false;
+            ResumeStation();
+            if (on_audio_channel_closed_ != nullptr) {
+                on_audio_channel_closed_();
+            }
+        }
     } else if (on_incoming_json_ != nullptr) {
         on_incoming_json_(root);
     }

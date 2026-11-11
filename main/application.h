@@ -6,6 +6,7 @@
 #include <freertos/task.h>
 #include <esp_timer.h>
 
+#include <atomic>
 #include <string>
 #include <mutex>
 #include <deque>
@@ -69,6 +70,8 @@ public:
     void Run();
 
     DeviceState GetDeviceState() const { return state_machine_.GetState(); }
+    bool IsMuted() const { return server_muted_.load(); }  // Mute is on at the server (board and Mac off; shown on the LED)
+    bool IsSilentMode() const { return server_silent_.load(); }  // silent mode is on at the server (shown on the LED)
     bool IsVoiceDetected() const { return audio_service_.IsVoiceDetected(); }
     
     /**
@@ -152,8 +155,18 @@ private:
     bool play_popup_on_listening_ = false;  // Flag to play popup sound after state changes to listening
     bool pending_listening_start_ = false;  // Waiting for playback to drain before starting listening (auto mode)
     int clock_ticks_ = 0;
+    int notify_started_tick_ = 0;
     int64_t wifi_lost_at_us_ = 0;
     bool using_ble_ = false;
+    bool ble_forced_ = false;
+    bool version_check_failed_ = false;
+    bool server_unreachable_ = false;
+    int64_t next_probe_us_ = 0;
+    int probe_misses_ = 0;
+    std::atomic<bool> server_probe_running_{false};
+    std::atomic<int> server_probe_result_{0};
+    std::atomic<bool> server_silent_{false};
+    std::atomic<bool> server_muted_{false};
     bool network_protocol_is_mqtt_ = false;
     TaskHandle_t activation_task_handle_ = nullptr;
 
@@ -185,6 +198,10 @@ private:
     void InitializeProtocol();
     void BindProtocolCallbacks();
     void ConsiderBleFallback();
+    bool BleWanted() const;
+    void NoteOpenFailure();
+    void SetLinkMode(bool bluetooth);
+    void ProbeServer();
     void UseWifiForNextTurn();
     std::unique_ptr<Protocol> MakeNetworkProtocol();
     void ShowActivationCode(const std::string& code, const std::string& message);
