@@ -8,6 +8,7 @@
 #include <freertos/task.h>
 
 #include "application.h"
+#include "diag_log.h"
 
 #define TAG "main"
 
@@ -21,6 +22,8 @@ extern "C" void app_main(void)
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
+
+    DiagLog::Init();
 
     // Initialize and run the application
     auto& app = Application::GetInstance();

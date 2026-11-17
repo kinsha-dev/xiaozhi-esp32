@@ -1,5 +1,6 @@
 # Define source files
-set(SOURCES "audio/audio_codec.cc"
+set(SOURCES "diag_log.cc"
+    "audio/audio_codec.cc"
             "audio/audio_debugger.cc"
             "audio/audio_service.cc"
             "audio/demuxer/ogg_demuxer.cc"

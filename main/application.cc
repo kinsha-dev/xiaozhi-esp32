@@ -1,4 +1,5 @@
 #include "application.h"
+#include "diag_log.h"
 #include "assets.h"
 #include "assets/lang_config.h"
 #include "audio_codec.h"
@@ -327,6 +328,8 @@ void Application::HandleNetworkConnectedEvent() {
 }
 
 void Application::HandleNetworkDisconnectedEvent() {
+    DiagLog::Event("app: network disconnected event state=%d ble=%d", (int)GetDeviceState(),
+                   (int)using_ble_);
     // Stopping the station for a BLE turn also reports "disconnected".
     // That must not tear the BLE audio channel down.
     if (using_ble_) {
@@ -596,6 +599,7 @@ void Application::BindProtocolCallbacks() {
     protocol_->OnConnected([this]() { DismissAlert(); });
 
     protocol_->OnNetworkError([this](const std::string& message) {
+        DiagLog::Event("proto: error %.40s", message.c_str());
         last_error_message_ = message;
         xEventGroupSetBits(event_group_, MAIN_EVENT_ERROR);
     });
