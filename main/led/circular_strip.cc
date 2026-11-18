@@ -195,24 +195,51 @@ void CircularStrip::OnStateChanged() {
             Blink(color, 500);
             break;
         }
-        case kDeviceStateIdle:
-            FadeOut(50);
+        case kDeviceStateIdle: {
+            if (app.IsMuted()) {
+                // muted at the Mac: a dim red, slow fade (distinct from silent mode's purple)
+                StripColor low = { 0, 0, 0 };
+                StripColor high = { 9, 0, 0 };
+                Breathe(low, high, 300);
+                break;
+            }
+            if (app.IsSilentMode()) {
+                // silent mode: a dim purple, even slower fade
+                StripColor low = { 0, 0, 0 };
+                StripColor high = { 5, 0, 8 };
+                Breathe(low, high, 300);
+                break;
+            }
+            // standby: a faint, slow blue breath
+            StripColor low = { 0, 0, 0 };
+            StripColor high = { 0, 0, 6 };
+            Breathe(low, high, 150);
             break;
+        }
         case kDeviceStateConnecting: {
-            StripColor color = { low_brightness_, low_brightness_, default_brightness_ };
-            SetAllColor(color);
+            // wake word recognised: quick cyan flashes
+            StripColor color = { 0, default_brightness_, default_brightness_ };
+            Blink(color, 120);
             break;
         }
         case kDeviceStateListening:
         case kDeviceStateAudioTesting: {
-            StripColor color = { default_brightness_, low_brightness_, low_brightness_ };
+            // green pulse that fades in and out like an echo while the board listens
+            StripColor low = { 0, 2, 0 };
+            StripColor high = { 0, default_brightness_, 0 };
+            Breathe(low, high, 45);
+            break;
+        }
+        case kDeviceStateSpeaking: {
+            StripColor color = { low_brightness_, default_brightness_, low_brightness_ };
             SetAllColor(color);
             break;
         }
-        case kDeviceStateSpeaking:
         case kDeviceStateNotifying: {
-            StripColor color = { low_brightness_, default_brightness_, low_brightness_ };
-            SetAllColor(color);
+            // opening a waiting notification: an amber light chasing round the ring
+            StripColor low = { 0, 0, 0 };
+            StripColor high = { default_brightness_, static_cast<uint8_t>(default_brightness_ / 3), 0 };
+            Scroll(low, high, 3, 90);
             break;
         }
         case kDeviceStateUpgrading: {

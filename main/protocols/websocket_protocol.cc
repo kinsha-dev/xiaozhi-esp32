@@ -3,6 +3,7 @@
 #include "board.h"
 #include "settings.h"
 #include "system_info.h"
+#include "diag_log.h"
 
 #include <esp_log.h>
 #include <arpa/inet.h>
@@ -171,15 +172,21 @@ bool WebsocketProtocol::OpenAudioChannel() {
 
     websocket_->OnDisconnected([this]() {
         ESP_LOGI(TAG, "Websocket disconnected");
+        DiagLog::Event("ws: DISCONNECTED (error_occurred=%d)", (int)error_occurred_);
         if (on_audio_channel_closed_ != nullptr) {
             on_audio_channel_closed_();
         }
+    });
+
+    websocket_->OnError([](const NetworkError& err) {
+        DiagLog::Event("ws: error %s", err.ToString().c_str());
     });
 
     ESP_LOGI(TAG, "Connecting to websocket server: %s with version: %d", url.c_str(), version_);
     if (auto connected = websocket_->Connect(url.c_str()); !connected) {
         ESP_LOGE(TAG, "Failed to connect to websocket server: %s",
                  connected.error().ToString().c_str());
+        DiagLog::Event("ws: connect FAILED %s", connected.error().ToString().c_str());
         SetError(Lang::Strings::SERVER_NOT_CONNECTED, url);
         return false;
     }
@@ -196,8 +203,18 @@ bool WebsocketProtocol::OpenAudioChannel() {
                             pdFALSE, pdMS_TO_TICKS(10000));
     if (!(bits & WEBSOCKET_PROTOCOL_SERVER_HELLO_EVENT)) {
         ESP_LOGE(TAG, "Failed to receive server hello");
+        DiagLog::Event("ws: server hello timeout");
         SetError(Lang::Strings::SERVER_TIMEOUT);
         return false;
+    }
+
+    DiagLog::Event("ws: connected");
+    {
+        // Upload buffered diagnostics (events since last upload) to the server.
+        auto log_json = DiagLog::BuildUploadJson();
+        if (!log_json.empty() && SendText(log_json)) {
+            DiagLog::MarkUploaded();
+        }
     }
 
     if (on_audio_channel_opened_ != nullptr) {

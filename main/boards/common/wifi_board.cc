@@ -160,6 +160,12 @@ void WifiBoard::SetNetworkEventCallback(NetworkEventCallback callback) {
 }
 
 void WifiBoard::OnWifiConnectTimeout(void* arg) {
+    // A saved network stays in station retry. The config AP is only the
+    // user-driven path; a long outage is the BLE fallback's job.
+    if (!SsidManager::GetInstance().GetSsidList().empty()) {
+        ESP_LOGW(TAG, "WiFi still down after %d s; keeping the saved network", CONNECT_TIMEOUT_SEC);
+        return;
+    }
     auto* board = static_cast<WifiBoard*>(arg);
     ESP_LOGW(TAG, "WiFi connection timeout, entering config mode");
 
