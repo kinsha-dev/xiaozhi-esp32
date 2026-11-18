@@ -161,6 +161,11 @@ private:
     bool ble_forced_ = false;
     bool version_check_failed_ = false;
     bool server_unreachable_ = false;
+    bool background_connect_ = false;   // idle keep-alive open: don't alert or fall back on failure
+    int keepalive_next_open_tick_ = 0;
+    int keepalive_backoff_s_ = 5;
+    int keepalive_last_ping_tick_ = 0;
+    void MaintainIdleConnection();
     int64_t next_probe_us_ = 0;
     int probe_misses_ = 0;
     std::atomic<bool> server_probe_running_{false};

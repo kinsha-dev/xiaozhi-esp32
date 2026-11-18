@@ -296,7 +296,38 @@ void Application::Run() {
                 StopNotification();
             }
             ConsiderBleFallback();
+            MaintainIdleConnection();
         }
+    }
+}
+
+// Keep the websocket open while idle on Wi-Fi: reopen it with backoff after any drop and
+// send a heartbeat every 30 s (the server counts it as activity and answers with a pong).
+void Application::MaintainIdleConnection() {
+    if (!protocol_ || using_ble_ || server_unreachable_ || GetDeviceState() != kDeviceStateIdle ||
+        !WifiManager::GetInstance().IsConnected()) {
+        return;
+    }
+    if (protocol_->IsAudioChannelOpened()) {
+        keepalive_backoff_s_ = 5;
+        if (clock_ticks_ - keepalive_last_ping_tick_ >= 30) {
+            keepalive_last_ping_tick_ = clock_ticks_;
+            protocol_->SendHeartbeat();
+        }
+        return;
+    }
+    if (clock_ticks_ < keepalive_next_open_tick_) {
+        return;
+    }
+    keepalive_next_open_tick_ = clock_ticks_ + keepalive_backoff_s_;
+    keepalive_backoff_s_ = std::min(keepalive_backoff_s_ * 2, 60);
+    DiagLog::Event("keepalive: reopening websocket");
+    background_connect_ = true;
+    bool ok = protocol_->OpenAudioChannel();
+    background_connect_ = false;
+    if (ok) {
+        keepalive_last_ping_tick_ = clock_ticks_;
+        keepalive_backoff_s_ = 5;
     }
 }
 
@@ -600,6 +631,9 @@ void Application::BindProtocolCallbacks() {
 
     protocol_->OnNetworkError([this](const std::string& message) {
         DiagLog::Event("proto: error %.40s", message.c_str());
+        if (background_connect_) {
+            return;  // silent: the keep-alive loop retries with backoff
+        }
         last_error_message_ = message;
         xEventGroupSetBits(event_group_, MAIN_EVENT_ERROR);
     });
