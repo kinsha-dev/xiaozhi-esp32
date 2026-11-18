@@ -22,8 +22,8 @@
 
 namespace {
 
-constexpr int kMaxEntries = 40;
-constexpr int kEntryLen = 144;
+constexpr int kMaxEntries = 16;
+constexpr int kEntryLen = 100;
 constexpr const char* kNs = "diag";
 
 struct Ring {
@@ -57,10 +57,29 @@ const char* ResetReasonName(esp_reset_reason_t r) {
     }
 }
 
-void Save() {
+// NVS is only 16KB and shared, so store one small string per entry (not one big blob).
+void SaveMeta(nvs_handle_t h) {
+    nvs_set_u32(h, "head", g_ring.head);
+    nvs_set_u32(h, "boot", g_ring.boot_count);
+    nvs_set_u32(h, "upl", g_ring.uploaded);
+}
+
+void SaveEntry(uint32_t idx) {
     nvs_handle_t h;
     if (nvs_open(kNs, NVS_READWRITE, &h) != ESP_OK) return;
-    nvs_set_blob(h, "ring", &g_ring, sizeof(g_ring));
+    char key[8];
+    snprintf(key, sizeof(key), "e%u", (unsigned)(idx % kMaxEntries));
+    esp_err_t e = nvs_set_str(h, key, g_ring.entries[idx % kMaxEntries]);
+    SaveMeta(h);
+    if (e == ESP_OK) e = nvs_commit(h);
+    if (e != ESP_OK) ESP_LOGE(TAG, "NVS save failed: 0x%x", (unsigned)e);
+    nvs_close(h);
+}
+
+void SaveMetaOnly() {
+    nvs_handle_t h;
+    if (nvs_open(kNs, NVS_READWRITE, &h) != ESP_OK) return;
+    SaveMeta(h);
     nvs_commit(h);
     nvs_close(h);
 }
@@ -69,10 +88,14 @@ void Load() {
     memset(&g_ring, 0, sizeof(g_ring));
     nvs_handle_t h;
     if (nvs_open(kNs, NVS_READONLY, &h) != ESP_OK) return;
-    size_t len = sizeof(g_ring);
-    Ring tmp;
-    if (nvs_get_blob(h, "ring", &tmp, &len) == ESP_OK && len == sizeof(Ring)) {
-        g_ring = tmp;
+    nvs_get_u32(h, "head", &g_ring.head);
+    nvs_get_u32(h, "boot", &g_ring.boot_count);
+    nvs_get_u32(h, "upl", &g_ring.uploaded);
+    for (int i = 0; i < kMaxEntries; i++) {
+        char key[8];
+        snprintf(key, sizeof(key), "e%d", i);
+        size_t len = kEntryLen;
+        nvs_get_str(h, key, g_ring.entries[i], &len);
     }
     nvs_close(h);
 }
@@ -116,6 +139,13 @@ namespace DiagLog {
 void Init() {
     if (g_inited) return;
     g_mutex = xSemaphoreCreateMutex();
+    {   // drop the old single-blob format; it filled the 16KB NVS partition
+        nvs_handle_t h;
+        if (nvs_open(kNs, NVS_READWRITE, &h) == ESP_OK) {
+            if (nvs_erase_key(h, "ring") == ESP_OK) nvs_commit(h);
+            nvs_close(h);
+        }
+    }
     Load();
     g_ring.boot_count++;
     g_inited = true;
@@ -132,7 +162,7 @@ void Init() {
 
 void Event(const char* fmt, ...) {
     if (!g_inited) return;
-    char msg[64];
+    char msg[48];
     va_list ap;
     va_start(ap, fmt);
     vsnprintf(msg, sizeof(msg), fmt, ap);
@@ -142,15 +172,15 @@ void Event(const char* fmt, ...) {
     int rssi = (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) ? ap_info.rssi : 0;
     time_t t = time(nullptr);
     char line[kEntryLen];
-    snprintf(line, sizeof(line), "t=%lld up=%llds heap=%u rssi=%d %s",
+    snprintf(line, sizeof(line), "t=%lld up=%llds h=%u r=%d %s",
              t > 1600000000 ? (long long)t : 0LL, (long long)(esp_timer_get_time() / 1000000),
              (unsigned)esp_get_free_heap_size(), rssi, msg);
     ESP_LOGW(TAG, "%s", line);
 
     xSemaphoreTake(g_mutex, portMAX_DELAY);
     strlcpy(g_ring.entries[g_ring.head % kMaxEntries], line, kEntryLen);
-    g_ring.head++;
-    Save();
+    uint32_t idx = g_ring.head++;
+    SaveEntry(idx);
     xSemaphoreGive(g_mutex);
 }
 
@@ -185,7 +215,7 @@ void MarkUploaded() {
     if (!g_inited) return;
     xSemaphoreTake(g_mutex, portMAX_DELAY);
     g_ring.uploaded = g_pending_upload_end;
-    Save();
+    SaveMetaOnly();
     xSemaphoreGive(g_mutex);
 }
 
